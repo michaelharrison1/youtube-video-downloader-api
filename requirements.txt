@@ -2,5 +2,4 @@ Flask~=3.1.1
 Pytube~=15.0.0
 gunicorn
 Flask-CORS~=6.0.1
-acrcloud
 pyacrcloud~=1.0.9

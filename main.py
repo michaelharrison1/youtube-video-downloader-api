@@ -5,23 +5,7 @@ import tempfile
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from pytube import YouTube
-
-# Attempt to import ACRCloudRecognizer, trying common package structures
-try:
-    # This is often the case if 'pyacrcloud' package installs 'acrcloud_recognizer.py' inside a 'pyacrcloud' folder
-    from pyacrcloud.acrcloud_recognizer import ACRCloudRecognizer
-
-    print("Successfully imported ACRCloudRecognizer from pyacrcloud.acrcloud_recognizer")
-except ImportError:
-    try:
-        # This is often the case if 'pyacrcloud' or a similar package installs 'acrcloud_recognizer.py' as a top-level module
-        from acrcloud_recognizer import ACRCloudRecognizer
-
-        print("Successfully imported ACRCloudRecognizer from acrcloud_recognizer (top-level)")
-    except ImportError as e:
-        print(f"Failed to import ACRCloudRecognizer. Please ensure the ACRCloud SDK is installed correctly. Error: {e}")
-        ACRCloudRecognizer = None  # Define as None if import fails, to prevent NameError later
-
+from acrcloud.recognizer import ACRCloudRecognizer
 app = Flask(__name__)
 CORS(app)
 
