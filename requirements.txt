@@ -2,3 +2,4 @@ Flask
 Pytube
 gunicorn
 Flask-CORS
+acrcloud_sdk_python3
