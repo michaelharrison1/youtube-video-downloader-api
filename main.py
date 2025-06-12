@@ -1,152 +1,149 @@
 import os
-import re
-import json
 import tempfile
-from flask import Flask, request, jsonify, send_file
+import logging
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pytube import YouTube
-from acrcloud.recognizer import ACRCloudRecognizer
-app = Flask(__name__)
-CORS(app)
+from pyacrcloud import ACRCloudRecognizer
 
-# ACRCloud Configuration - Loaded from environment variables
-ACR_CONFIG = {
-    'host': os.environ.get('ACR_HOST'),
-    'access_key': os.environ.get('ACR_ACCESS_KEY'),
-    'access_secret': os.environ.get('ACR_ACCESS_SECRET'),
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# ACRCloud Configuration (ensure these are set as environment variables on Render)
+acr_config = {
+    'host': os.environ.get('ACR_CLOUD_HOST'),
+    'access_key': os.environ.get('ACR_CLOUD_ACCESS_KEY'),
+    'access_secret': os.environ.get('ACR_CLOUD_ACCESS_SECRET'),
     'timeout': 10  # seconds
 }
 
-if not ACRCloudRecognizer:
-    print("Warning: ACRCloudRecognizer could not be imported. /scan_youtube_audio endpoint will not function.")
-elif not all([ACR_CONFIG['host'], ACR_CONFIG['access_key'], ACR_CONFIG['access_secret']]):
-    print(
-        "Warning: ACRCloud environment variables (ACR_HOST, ACR_ACCESS_KEY, ACR_ACCESS_SECRET) are not fully set. /scan_youtube_audio endpoint might not work correctly even if SDK is imported.")
+if not all([acr_config['host'], acr_config['access_key'], acr_config['access_secret']]):
+    logging.warning("ACRCloud configuration is incomplete. Recognition will fail.")
+    acr_recognizer = None
+else:
+    acr_recognizer = ACRCloudRecognizer(acr_config)
 
+def map_acr_match_to_soundtrace_format(acr_match):
+    """Maps a single ACRCloud music item to the SoundTrace AcrCloudMatch format."""
+    spotify_artist_id = acr_match.get('external_metadata', {}).get('spotify', {}).get('artists', [{}])[0].get('id')
+    spotify_track_id = acr_match.get('external_metadata', {}).get('spotify', {}).get('track', {}).get('id')
+    youtube_video_id = acr_match.get('external_metadata', {}).get('youtube', {}).get('vid')
 
-def is_valid_youtube_url(url):
-    """Validate YouTube URL."""
-    regex = r"^(https://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w-]+(&\S*)?$"
-    return re.match(regex, url)
-
-
-@app.route('/video_info', methods=['POST'])
-def video_info():
-    data = request.get_json()
-    if not data or 'url' not in data:
-        return jsonify({"error": "Missing 'url' in request body"}), 400
-
-    url = data['url']
-    if not is_valid_youtube_url(url):
-        return jsonify({"error": "Invalid YouTube URL"}), 400
-
-    try:
-        yt = YouTube(url)
-        info = {
-            "title": yt.title,
-            "author": yt.author,
-            "length": yt.length,
-            "views": yt.views,
-            "description": yt.description,
-            "publish_date": yt.publish_date.isoformat() if yt.publish_date else None,
-            "thumbnail_url": yt.thumbnail_url
+    return {
+        'id': acr_match.get('acrid'),
+        'title': acr_match.get('title', 'Unknown Title'),
+        'artist': ', '.join([artist.get('name', 'Unknown Artist') for artist in acr_match.get('artists', [])]) or 'Unknown Artist',
+        'album': acr_match.get('album', {}).get('name', 'Unknown Album'),
+        'releaseDate': acr_match.get('release_date', 'N/A'),
+        'matchConfidence': acr_match.get('score', 0),
+        'spotifyArtistId': spotify_artist_id,
+        'spotifyTrackId': spotify_track_id,
+        'youtubeVideoId': youtube_video_id,
+        'youtubeVideoTitle': acr_match.get('title'), # Fallback, consider if better source for YT title
+        'platformLinks': {
+            'spotify': f"https://open.spotify.com/track/{spotify_track_id}" if spotify_track_id else None,
+            'youtube': f"https://www.youtube.com/watch?v={youtube_video_id}" if youtube_video_id else None,
         }
-        return jsonify(info), 200
-    except Exception as e:
-        return jsonify({"error": f"Error fetching video info: {str(e)}"}), 500
+    }
 
-
-@app.route('/download/<resolution>', methods=['POST'])
-def download_video(resolution):
+@app.route('/api/process-youtube-url', methods=['POST'])
+def process_youtube_url():
+    logging.info("Received request for /api/process-youtube-url")
     data = request.get_json()
     if not data or 'url' not in data:
-        return jsonify({"error": "Missing 'url' in request body"}), 400
+        logging.error("Request missing 'url' in JSON payload")
+        return jsonify({'error': "Missing 'url' in JSON payload"}), 400
 
-    url = data['url']
-    if not is_valid_youtube_url(url):
-        return jsonify({"error": "Invalid YouTube URL"}), 400
+    youtube_url = data['url']
+    logging.info(f"Processing URL: {youtube_url}")
 
-    temp_dir = tempfile.gettempdir()
-    file_path = None
+    if not acr_recognizer:
+        logging.error("ACRCloud recognizer not initialized due to missing config.")
+        return jsonify({'error': 'ACRCloud service not configured on server.'}), 500
 
+    temp_file_path = None
     try:
-        yt = YouTube(url)
-        stream = None
-        if resolution.lower() == 'audio':
-            stream = yt.streams.get_audio_only()
-            if not stream:
-                return jsonify({"error": "No audio stream found"}), 404
-            filename = f"{yt.video_id}_audio.mp4"
-        else:
-            stream = yt.streams.filter(res=resolution, progressive=True, file_extension='mp4').first()
-            if not stream:
-                stream = yt.streams.filter(res=resolution,
-                                           file_extension='mp4').first()  # Try non-progressive if progressive not found
-            if not stream:
-                return jsonify({"error": f"No stream found for resolution {resolution}"}), 404
-            filename = f"{yt.video_id}_{resolution}.mp4"
-
-        file_path = os.path.join(temp_dir, filename)
-        stream.download(output_path=temp_dir, filename=filename)
-
-        return send_file(file_path, as_attachment=True, download_name=stream.default_filename)
-    except Exception as e:
-        return jsonify({"error": f"Error downloading video: {str(e)}"}), 500
-    finally:
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                print(f"Error deleting temporary file {file_path}: {str(e)}")
-
-
-@app.route('/scan_youtube_audio', methods=['POST'])
-def scan_youtube_audio():
-    if not ACRCloudRecognizer:
-        return jsonify({"error": "ACRCloud SDK is not available on the server."}), 503
-    if not all([ACR_CONFIG['host'], ACR_CONFIG['access_key'], ACR_CONFIG['access_secret']]):
-        return jsonify({"error": "ACRCloud service is not configured on the server."}), 503
-
-    data = request.get_json()
-    if not data or 'url' not in data:
-        return jsonify({"error": "Missing 'url' in request body"}), 400
-
-    url = data['url']
-    if not is_valid_youtube_url(url):
-        return jsonify({"error": "Invalid YouTube URL"}), 400
-
-    temp_audio_path = None
-    try:
-        yt = YouTube(url)
-        audio_stream = yt.streams.get_audio_only()
+        # 1. Download YouTube audio
+        yt = YouTube(youtube_url)
+        # Filter for audio streams and get the first one (often Opus or M4A)
+        audio_stream = yt.streams.filter(only_audio=True).first()
         if not audio_stream:
-            return jsonify({"error": "Could not retrieve audio stream from YouTube video."}), 404
+            logging.error(f"No audio stream found for URL: {youtube_url}")
+            return jsonify({'error': 'No audio stream found for the given YouTube URL.'}), 404
 
-        temp_dir = tempfile.gettempdir()
-        audio_filename = f"{yt.video_id}_audio_for_scan.mp4"
-        temp_audio_path = os.path.join(temp_dir, audio_filename)
-        audio_stream.download(output_path=temp_dir, filename=audio_filename)
+        # Download to a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{audio_stream.subtype or 'mp4'}") as tmpfile:
+            temp_file_path = tmpfile.name
+            logging.info(f"Downloading audio for {youtube_url} to {temp_file_path}")
+            audio_stream.download(output_path=os.path.dirname(temp_file_path), filename=os.path.basename(temp_file_path))
+        logging.info(f"Download complete: {temp_file_path}")
 
-        recognizer = ACRCloudRecognizer(ACR_CONFIG)
-        acr_result_raw = recognizer.recognize_by_file(temp_audio_path, 0)
-        acr_result_json = json.loads(acr_result_raw)
+        # 2. Send to ACRCloud
+        # The recognize_by_file method expects a file path.
+        # We can scan for a certain duration, e.g., the first 15 seconds.
+        # ACRCloud's free tier usually allows short snippets.
+        logging.info(f"Starting ACRCloud recognition for {temp_file_path}")
+        # The pyacrcloud library expects start_seconds and rec_length for snippets.
+        # If you want to scan the whole file (up to ACRCloud limits), omit these.
+        # For snippet scanning, you might choose a default. SoundTrace uses 12s.
+        scan_results_json_string = acr_recognizer.recognize_by_file(temp_file_path, start_seconds=0, rec_length=12)
+        logging.info(f"ACRCloud raw response: {scan_results_json_string[:500]}...") # Log beginning of response
 
-        return jsonify(acr_result_json), 200
+        import json # Ensure json is imported
+        scan_results = json.loads(scan_results_json_string)
+
+        acr_status_code = scan_results.get('status', {}).get('code', -1)
+        acr_status_msg = scan_results.get('status', {}).get('msg', 'Unknown ACRCloud status')
+
+        if acr_status_code == 0: # Success
+            matches = [map_acr_match_to_soundtrace_format(music_item) for music_item in scan_results.get('metadata', {}).get('music', [])]
+            logging.info(f"ACRCloud success for {youtube_url}. Matches found: {len(matches)}")
+            return jsonify({
+                'matches': matches,
+                'acrCode': acr_status_code,
+                'acrResponse': acr_status_msg # Or a snippet of the full JSON response
+            }), 200
+        elif acr_status_code == 1001: # No result
+            logging.info(f"ACRCloud no result for {youtube_url}.")
+            return jsonify({
+                'matches': [],
+                'acrCode': acr_status_code,
+                'acrResponse': acr_status_msg
+            }), 200
+        else: # Other ACRCloud error
+            logging.error(f"ACRCloud error for {youtube_url}. Code: {acr_status_code}, Msg: {acr_status_msg}")
+            return jsonify({
+                'error': f"ACRCloud recognition error: {acr_status_msg}",
+                'matches': [],
+                'acrCode': acr_status_code,
+                'acrResponse': acr_status_msg
+            }), 500 # Or a more specific status based on ACR code
 
     except Exception as e:
-        error_response = {"error": f"Error scanning audio: {str(e)}"}
-        # Check if acr_result_json was defined before trying to access it
-        if 'acr_result_json' in locals() and acr_result_json and 'status' in acr_result_json:
-            error_response["acr_status"] = acr_result_json['status']
-        return jsonify(error_response), 500
+        logging.error(f"Error processing {youtube_url}: {str(e)}", exc_info=True)
+        # Determine if it's a Pytube error or other
+        if "HTTP Error 404" in str(e) or "Video unavailable" in str(e): # Pytube specific errors
+            return jsonify({'error': f'YouTube video error: {str(e)}'}), 404
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
     finally:
-        if temp_audio_path and os.path.exists(temp_audio_path):
+        if temp_file_path and os.path.exists(temp_file_path):
             try:
-                os.remove(temp_audio_path)
-            except Exception as e:
-                print(f"Error deleting temporary audio file {temp_audio_path}: {str(e)}")
+                os.remove(temp_file_path)
+                logging.info(f"Temporary file {temp_file_path} deleted.")
+            except Exception as e_clean:
+                logging.error(f"Error deleting temporary file {temp_file_path}: {str(e_clean)}")
 
+@app.route('/')
+def home():
+    return "youtube-download API is running. Use /api/process-youtube-url endpoint."
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    port = int(os.environ.get('PORT', 8080)) # Render typically sets PORT
+    # For Render, Gunicorn is usually used to run the app, defined in Procfile
+    # app.run(host='0.0.0.0', port=port, debug=False) # Debug=False for production
+    # If running directly with `python main.py` (e.g. local testing without Gunicorn)
+    # set debug=True for easier local development if needed.
+    app.run(host='0.0.0.0', port=port)
