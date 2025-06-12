@@ -5,8 +5,7 @@ import tempfile
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from pytube import YouTube
-from acrcloud_sdk_python3.acrcloud_recognizer import \
-    ACRCloudRecognizer  # Assuming this is the correct import path for the user's package
+from acrcloud.acrcloud_recognizer import ACRCloudRecognizer
 
 app = Flask(__name__)
 CORS(app)
