@@ -15,6 +15,7 @@ from pytube.exceptions import (
 )
 from acrcloud.recognizer import ACRCloudRecognizer  # Corrected import
 import json
+import urllib.error  # Explicit import for checking HTTPError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,8 +23,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# ACRCloud Configuration (ensure these are set as environment variables on Render)
-acr_config = {
+# ACRCloud Configuration
+acr_config_details = {
     'host': os.environ.get('ACR_CLOUD_HOST') or os.environ.get('ACR_HOST'),
     'access_key': os.environ.get('ACR_CLOUD_ACCESS_KEY') or os.environ.get('ACR_ACCESS_KEY'),
     'access_secret': os.environ.get('ACR_CLOUD_ACCESS_SECRET') or os.environ.get('ACR_ACCESS_SECRET'),
@@ -31,19 +32,18 @@ acr_config = {
 }
 
 acr_recognizer = None
-if not all([acr_config['host'], acr_config['access_key'], acr_config['access_secret']]):
+if not all([acr_config_details['host'], acr_config_details['access_key'], acr_config_details['access_secret']]):
     logging.warning(
         "ACRCloud configuration is incomplete. Recognition will fail. Please check ACR_CLOUD_HOST/ACR_HOST, ACR_CLOUD_ACCESS_KEY/ACR_ACCESS_KEY, ACR_CLOUD_ACCESS_SECRET/ACR_ACCESS_SECRET env vars.")
 else:
     try:
-        acr_recognizer = ACRCloudRecognizer(acr_config)
+        acr_recognizer = ACRCloudRecognizer(acr_config_details)
         logging.info("ACRCloud Recognizer initialized successfully.")
     except Exception as e:
         logging.error(f"Failed to initialize ACRCloud Recognizer: {e}")
 
 
 def map_acr_match_to_soundtrace_format(acr_match):
-    """Maps a single ACRCloud music item to the SoundTrace AcrCloudMatch format."""
     spotify_data = acr_match.get('external_metadata', {}).get('spotify', {})
     spotify_artist_id = spotify_data.get('artists', [{}])[0].get('id') if spotify_data.get('artists') else None
     spotify_track_id = spotify_data.get('track', {}).get('id') if spotify_data.get('track') else None
@@ -88,14 +88,12 @@ def process_youtube_url():
     temp_file_path = None
     try:
         # 1. Download YouTube audio
-        # Using a common user agent can sometimes help.
-        yt = YouTube(youtube_url, use_oauth=False, allow_oauth_cache=False,
-                     headers={
-                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'})
+        # Removed 'headers' argument as it's not supported directly
+        yt = YouTube(youtube_url, use_oauth=False, allow_oauth_cache=False)
 
-        audio_stream = yt.streams.filter(only_audio=True, abr='128kbps').first()  # Try for a decent quality audio
+        audio_stream = yt.streams.filter(only_audio=True, abr='128kbps').first()
         if not audio_stream:
-            audio_stream = yt.streams.filter(only_audio=True).first()  # Fallback to any audio
+            audio_stream = yt.streams.filter(only_audio=True).first()
 
         if not audio_stream:
             logging.error(f"No audio stream found for URL: {youtube_url}")
@@ -134,34 +132,39 @@ def process_youtube_url():
 
     except (
     VideoUnavailable, AgeRestrictedError, MembersOnly, RecordingUnavailable, VideoPrivate, LiveStreamError) as e_pytube:
-        logging.error(f"Pytube - Video specific error for {youtube_url}: {str(e_pytube)}",
-                      exc_info=False)  # Less verbose for these
-        return jsonify({'error': f'YouTube video error: {str(e_pytube)}', 'acrCode': 9001,
-                        'acrResponse': str(e_pytube)}), 404  # Using 404 as video is not accessible
-    except PytubeError as e_pytube_generic:  # Catch other generic Pytube errors
+        logging.error(f"Pytube - Video specific error for {youtube_url}: {str(e_pytube)}", exc_info=False)
+        return jsonify(
+            {'error': f'YouTube video error: {str(e_pytube)}', 'acrCode': 9001, 'acrResponse': str(e_pytube)}), 404
+    except PytubeError as e_pytube_generic:
         logging.error(f"Pytube - Generic error for {youtube_url}: {str(e_pytube_generic)}", exc_info=True)
         return jsonify({'error': f'YouTube library error: {str(e_pytube_generic)}', 'acrCode': 9002,
                         'acrResponse': str(e_pytube_generic)}), 500
     except Exception as e:
-        # Check if it's a urllib HTTPError from pytube for more specific messaging
-        if isinstance(e,
-                      urllib.error.HTTPError if 'urllib' in globals() else Exception):  # Conditional import for urllib
+        if isinstance(e, urllib.error.HTTPError):  # Check if it's an HTTPError (likely from Pytube's internal requests)
+            error_code_for_response = 9000 + e.code  # Create a custom acrCode based on HTTP status
             if e.code == 400:
                 logging.error(f"HTTP Error 400 (Bad Request) from YouTube for {youtube_url}: {str(e)}", exc_info=True)
-                return jsonify({'error': f'YouTube API Bad Request (HTTP 400): {str(e)}', 'acrCode': 9400,
-                                'acrResponse': str(e)}), 502  # 502 Bad Gateway as we failed to get from upstream
+                return jsonify(
+                    {'error': f'YouTube API Bad Request (HTTP 400): {str(e)}', 'acrCode': error_code_for_response,
+                     'acrResponse': str(e)}), 502
             elif e.code == 403:
                 logging.error(f"HTTP Error 403 (Forbidden) from YouTube for {youtube_url}: {str(e)}", exc_info=True)
-                return jsonify({'error': f'YouTube API Forbidden (HTTP 403): {str(e)}', 'acrCode': 9403,
-                                'acrResponse': str(e)}), 502
-            elif e.code == 429:  # Rate limited by YouTube
+                return jsonify(
+                    {'error': f'YouTube API Forbidden (HTTP 403): {str(e)}', 'acrCode': error_code_for_response,
+                     'acrResponse': str(e)}), 502
+            elif e.code == 429:
                 logging.error(f"HTTP Error 429 (Too Many Requests) from YouTube for {youtube_url}: {str(e)}",
                               exc_info=True)
+                return jsonify({'error': f'Rate limited by YouTube (HTTP 429). Please try again later.',
+                                'acrCode': error_code_for_response, 'acrResponse': str(e)}), 429
+            else:  # Other HTTP errors from Pytube
+                logging.error(f"HTTP Error {e.code} from YouTube for {youtube_url}: {str(e)}", exc_info=True)
                 return jsonify(
-                    {'error': f'Rate limited by YouTube (HTTP 429). Please try again later.', 'acrCode': 9429,
-                     'acrResponse': str(e)}), 429
+                    {'error': f'YouTube API Error (HTTP {e.code}): {str(e)}', 'acrCode': error_code_for_response,
+                     'acrResponse': str(e)}), 502
 
-        logging.error(f"Error processing {youtube_url}: {str(e)}", exc_info=True)
+        # Fallback for other non-HTTPError, non-Pytube specific exceptions
+        logging.error(f"General error processing {youtube_url}: {str(e)}", exc_info=True)
         return jsonify({'error': f'Server error: {str(e)}', 'acrCode': 9500, 'acrResponse': str(e)}), 500
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
@@ -179,8 +182,5 @@ def home():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    # For production, Gunicorn is recommended. This is for local dev or simple Render setups.
-    # Render's default might use Gunicorn via Procfile: web: gunicorn main:app
-    # If not using Gunicorn, ensure Flask's dev server is NOT used in production.
     is_production = os.environ.get('FLASK_ENV') == 'production' or os.environ.get('NODE_ENV') == 'production'
     app.run(host='0.0.0.0', port=port, debug=not is_production)
