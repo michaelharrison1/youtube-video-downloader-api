@@ -4,7 +4,7 @@ import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pytube import YouTube
-from pyacrcloud import ACRCloudRecognizer
+from acrcloud.recognizer import ACRCloudRecognizer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
